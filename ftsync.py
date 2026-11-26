@@ -6,65 +6,66 @@ Usage: ftsync.py [URL]   sync, run FreeTube, sync again
        ftsync.py test    run the self-check
 
 Each sync is a 3-way merge of the local FreeTube data, the shared copy in
-remote (a folder that Nextcloud or similar keeps in sync), and the
-state of the last sync on this machine (the base). The base tells an
-addition on one side from a removal on the other. A machine without a base
-adopts the shared copy as it is.
+~/Nextcloud/FreeTube-sync (the remote), and the state of the last sync on
+this machine (the base). The base tells an addition on one side from a
+removal on the other. Without a base, both sides count as additions and
+merge. A missing local file adopts the shared copy, which seeds a fresh
+install before FreeTube's first start.
 
-Optional config in $XDG_CONFIG_HOME/ftsync/config.toml, keys:
-  local = "~/.config/FreeTube"         FreeTube data, default detected
-  remote = "~/Nextcloud/FreeTube-sync" shared folder, this is the default
-  cmd = ["freetube"]                   start command, default detected
+Only the Flatpak install is supported.
 """
 import json
 import os
 import subprocess
 import sys
 import tempfile
-import tomllib
 from pathlib import Path
 
 APP = 'io.freetubeapp.FreeTube'
-FLATPAK = Path.home() / '.var/app' / APP / 'config/FreeTube'
-CONFIG = Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config')) / 'ftsync/config.toml'
-BASE = Path(os.environ.get('XDG_STATE_HOME', Path.home() / '.local/state')) / 'ftsync'
-LOCAL_ONLY = {'bounds'}  # settings that stay per machine
+LOCAL = Path.home() / '.var/app' / APP / 'config/FreeTube'
+REMOTE = Path.home() / 'Nextcloud/FreeTube-sync'
+# An empty XDG variable counts as unset, as the XDG spec says.
+BASE = Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local/state') / 'ftsync'
+# settings that stay per machine
+LOCAL_ONLY = {
+    'bounds',  # window properties
+}
 
 
-def config(path):
-    """Return (local, remote, cmd); cmd None means the Flatpak."""
-    c = tomllib.loads(path.read_text()) if path.exists() else {}
-    if unknown := set(c) - {'local', 'remote', 'cmd'}:
-        raise SystemExit(f'{path}: unknown keys {sorted(unknown)}')
-    if 'local' in c:
-        local = Path(c['local']).expanduser()
-    else:
-        native = Path.home() / '.config/FreeTube'
-        local = native if native.is_dir() and not FLATPAK.is_dir() else FLATPAK
-    remote = Path(c.get('remote', '~/Nextcloud/FreeTube-sync')).expanduser()
-    cmd = c.get('cmd', None if local == FLATPAK else ['freetube'])
-    return local, remote, cmd and [os.path.expanduser(a) for a in cmd]
+def notify(msg):
+    print(msg, file=sys.stderr)
+    try:
+        subprocess.run(['notify-send', 'FreeTube sync failed', msg], check=False)
+    except FileNotFoundError:
+        pass
 
 
-LOCAL, REMOTE, CMD = config(CONFIG)
+def merge3(base, local, remote, conflict):
+    """3-way merge of dicts id -> doc; a missing doc is None. First match wins:
 
+    - local == remote, or remote == base: take local
+    - local == base: take remote
+    - one side None: edit overrules deletion, take the other
+    - else: conflict(base, local, remote)
 
-def merge3(b, l, r, conflict):
-    """Merge dicts keyed by id. An edit beats a deletion."""
-    out = {}
-    for k in list(l) + [k for k in r if k not in l]:
-        B, L, R = b.get(k), l.get(k), r.get(k)
-        if L == R or R == B:
-            v = L
-        elif L == B:
-            v = R
-        elif L is None or R is None:
-            v = L or R
+    A None result drops the id. Empty base: both sides are kept.
+    """
+    merged = {}
+    for id in list(local) + [i for i in remote if i not in local]:
+        in_base = base.get(id)
+        in_local = local.get(id)
+        in_remote = remote.get(id)
+        if in_local == in_remote or in_remote == in_base:
+            doc = in_local
+        elif in_local == in_base:
+            doc = in_remote
+        elif in_local is None or in_remote is None:
+            doc = in_local or in_remote
         else:
-            v = conflict(B, L, R)
-        if v is not None:
-            out[k] = v
-    return out
+            doc = conflict(in_base, in_local, in_remote)
+        if doc is not None:
+            merged[id] = doc
+    return merged
 
 
 def newer(field):
@@ -96,7 +97,7 @@ def load(path, key):
     docs = {}
     if not path.exists():
         return docs
-    for line in path.read_text().splitlines():
+    for line in path.read_text(encoding='utf-8').splitlines():
         if not line.strip():
             continue
         o = json.loads(line)
@@ -112,58 +113,53 @@ def load(path, key):
 def dump(path, docs):
     text = ''.join(json.dumps(o, ensure_ascii=False, separators=(',', ':')) + '\n'
                    for o in docs.values())
-    if path.exists() and path.read_text() == text:
+    if path.exists() and path.read_text(encoding='utf-8') == text:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + '.tmp')
-    tmp.write_text(text)
+    tmp = path.with_name(path.name + '~')  # Nextcloud ignores *~ by default
+    tmp.write_text(text, encoding='utf-8')
     tmp.replace(path)
 
 
 def sync():
-    if not LOCAL.is_dir():
-        raise SystemExit(f'no FreeTube data in {LOCAL}, start FreeTube once first')
     for name, (key, conflict) in COLLECTIONS.items():
-        l = load(LOCAL / name, key)
-        r = load(REMOTE / name, key)
-        if not (BASE / name).exists() and (REMOTE / name).exists():
-            b = l = r  # new machine: adopt the shared copy
+        local_file, remote_file, base_file = LOCAL / name, REMOTE / name, BASE / name
+        if not local_file.exists() and not remote_file.exists():
+            continue  # nothing on either side, do not create empty files
+        local = load(local_file, key)
+        remote = load(remote_file, key)
+        if not local_file.exists():
+            base = local = remote  # fresh install or lost file: adopt the shared copy
         else:
-            b = load(BASE / name, key)
-        # Nextcloud conflict copies hold changes another machine uploaded.
+            base = load(base_file, key)  # no base yet: empty, so both sides merge
+        # A Nextcloud conflict copy holds this machine's upload that lost a race.
         copies = sorted(REMOTE.glob(f'{name[:-3]} (conflicted copy*).db'))
-        keep = {k: v for k, v in load(LOCAL / name, key).items() if k in LOCAL_ONLY}
-        l, r, b = ({k: v for k, v in d.items() if k not in LOCAL_ONLY} for d in (l, r, b))
-        m = merge3(b, l, r, conflict)
-        for c in copies:
-            m = merge3(b, m, load(c, key), conflict)
-        dump(REMOTE / name, m)
-        dump(BASE / name, m)
-        dump(LOCAL / name, m | keep)
-        for c in copies:
-            c.unlink()
+        keep = {k: v for k, v in load(local_file, key).items() if k in LOCAL_ONLY}
+        local, remote, base = ({k: v for k, v in d.items() if k not in LOCAL_ONLY}
+                               for d in (local, remote, base))
+        merged = merge3(base, local, remote, conflict)
+        for copy in copies:
+            merged = merge3(base, merged, load(copy, key), conflict)
+        # Base last: a sync cut short anywhere before it merges again correctly.
+        dump(local_file, merged | keep)
+        dump(remote_file, merged)
+        for copy in copies:
+            copy.unlink()
+        dump(base_file, merged)
 
 
 def running():
-    # Electron keeps this symlink in the data folder while FreeTube runs.
-    return os.path.lexists(LOCAL / 'SingletonLock')
+    # Electron's SingletonLock outlives a crash, flatpak ps lags behind a close.
+    if not os.path.lexists(LOCAL / 'SingletonLock'):
+        return False
+    ps = subprocess.run(['flatpak', 'ps', '--columns=application'],
+                        capture_output=True, text=True, check=True)
+    return APP in ps.stdout.split()
 
 
 def launch(args):
-    if CMD:
-        subprocess.run([*CMD, *args], check=False)
-    else:
-        subprocess.run(['flatpak', 'run', '--command=/app/bin/run.sh',
-                        '--file-forwarding', APP, '@@u', *args, '@@'],
-                       check=False)
-
-
-def notify(msg):
-    print(msg, file=sys.stderr)
-    try:
-        subprocess.run(['notify-send', 'FreeTube sync failed', msg], check=False)
-    except FileNotFoundError:
-        pass
+    subprocess.run(['flatpak', 'run', '--file-forwarding', APP, '@@u', *args, '@@'],
+                   check=False)
 
 
 def safe_sync():
@@ -174,6 +170,7 @@ def safe_sync():
 
 
 def test():
+    global REMOTE
     s = lambda *ids: {'_id': 'allChannels', 'lastUpdatedAt': 0,
                       'subscriptions': [{'id': i} for i in ids]}
     f = COLLECTIONS['profiles.db'][1]
@@ -185,16 +182,45 @@ def test():
     assert merge3({'x': 1}, {}, {'x': 2}, None) == {'x': 2}
     h = COLLECTIONS['history.db'][1]
     assert merge3({}, {'v': {'timeWatched': 1}}, {'v': {'timeWatched': 2}}, h)['v']['timeWatched'] == 2
+
+    # Machines a, b, c share one remote folder.
     with tempfile.TemporaryDirectory() as d:
-        t = Path(d) / 'config.toml'
-        t.write_text('remote = "~/x"\ncmd = ["~/a b", "-v"]\n')
-        assert config(t)[1:] == (Path.home() / 'x', [str(Path.home() / 'a b'), '-v']), config(t)
-        t.write_text('remot = "~/x"\n')
-        try:
-            config(t)
-            raise AssertionError('typo key accepted')
-        except SystemExit:
-            pass
+        d = Path(d)
+        REMOTE = d / 'remote'
+
+        def on(machine):
+            global LOCAL, BASE
+            LOCAL, BASE = d / machine, d / f'{machine}-base'
+            sync()
+
+        v = lambda i: {'_id': f'{i}-id', 'videoId': i, 'timeWatched': 1}
+        ids = lambda p: sorted(load(p, 'videoId'))
+        # first machine, FreeTube never started, empty remote: nothing written
+        on('c')
+        assert not (d / 'c').exists() and not REMOTE.exists()
+        dump(d / 'a/history.db', {'v1': v('v1'), 'v2': v('v2')})
+        dump(d / 'a/settings.db', {'bounds': {'_id': 'bounds', 'value': 'a'},
+                                   'theme': {'_id': 'theme', 'value': 'dark'}})
+        on('a')
+        assert ids(REMOTE / 'history.db') == ['v1', 'v2']
+        assert sorted(load(REMOTE / 'settings.db', '_id')) == ['theme']
+        # fresh install: missing data folder is seeded from the remote
+        on('b')
+        assert ids(d / 'b/history.db') == ['v1', 'v2']
+        # removal on b reaches a, a keeps its own bounds
+        dump(d / 'b/history.db', {'v2': v('v2')})
+        on('b')
+        on('a')
+        assert ids(d / 'a/history.db') == ['v2']
+        assert load(d / 'a/settings.db', '_id')['bounds']['value'] == 'a'
+        # a lost local file is restored, not deleted everywhere
+        (d / 'a/history.db').unlink()
+        on('a')
+        assert ids(REMOTE / 'history.db') == ids(d / 'a/history.db') == ['v2']
+        # machine with its own data but no base merges, drops nothing
+        dump(d / 'e/history.db', {'v3': v('v3')})
+        on('e')
+        assert ids(REMOTE / 'history.db') == ids(d / 'e/history.db') == ['v2', 'v3']
     print('ok')
 
 
@@ -207,9 +233,10 @@ if __name__ == '__main__':
             raise SystemExit('close FreeTube first')
         sync()
     else:
-        was_running = running()
-        if not was_running:
+        # Already running: launch only hands args to the open window.
+        if running():
+            launch(args)
+        else:
             safe_sync()
-        launch(args)
-        if not was_running and not running():
+            launch(args)  # returns when FreeTube exits
             safe_sync()
