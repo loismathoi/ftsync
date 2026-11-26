@@ -6,26 +6,47 @@ Usage: ftsync.py [URL]   sync, run FreeTube, sync again
        ftsync.py test    run the self-check
 
 Each sync is a 3-way merge of the local FreeTube data, the shared copy in
-FTSYNC_REMOTE (a folder that Nextcloud or similar keeps in sync), and the
+remote (a folder that Nextcloud or similar keeps in sync), and the
 state of the last sync on this machine (the base). The base tells an
 addition on one side from a removal on the other. A machine without a base
 adopts the shared copy as it is.
 
-FTSYNC_LOCAL and FTSYNC_CMD default to the FreeTube Flatpak.
+Optional config in $XDG_CONFIG_HOME/ftsync/config.toml, keys:
+  local = "~/.config/FreeTube"         FreeTube data, default detected
+  remote = "~/Nextcloud/FreeTube-sync" shared folder, this is the default
+  cmd = ["freetube"]                   start command, default detected
 """
 import json
 import os
-import shlex
 import subprocess
 import sys
+import tempfile
+import tomllib
 from pathlib import Path
 
 APP = 'io.freetubeapp.FreeTube'
-LOCAL = Path(os.environ.get(
-    'FTSYNC_LOCAL', Path.home() / '.var/app' / APP / 'config/FreeTube'))
-REMOTE = Path(os.environ.get('FTSYNC_REMOTE', Path.home() / 'Nextcloud/FreeTube-sync'))
+FLATPAK = Path.home() / '.var/app' / APP / 'config/FreeTube'
+CONFIG = Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config')) / 'ftsync/config.toml'
 BASE = Path(os.environ.get('XDG_STATE_HOME', Path.home() / '.local/state')) / 'ftsync'
 LOCAL_ONLY = {'bounds'}  # settings that stay per machine
+
+
+def config(path):
+    """Return (local, remote, cmd); cmd None means the Flatpak."""
+    c = tomllib.loads(path.read_text()) if path.exists() else {}
+    if unknown := set(c) - {'local', 'remote', 'cmd'}:
+        raise SystemExit(f'{path}: unknown keys {sorted(unknown)}')
+    if 'local' in c:
+        local = Path(c['local']).expanduser()
+    else:
+        native = Path.home() / '.config/FreeTube'
+        local = native if native.is_dir() and not FLATPAK.is_dir() else FLATPAK
+    remote = Path(c.get('remote', '~/Nextcloud/FreeTube-sync')).expanduser()
+    cmd = c.get('cmd', None if local == FLATPAK else ['freetube'])
+    return local, remote, cmd and [os.path.expanduser(a) for a in cmd]
+
+
+LOCAL, REMOTE, CMD = config(CONFIG)
 
 
 def merge3(b, l, r, conflict):
@@ -129,18 +150,18 @@ def running():
 
 
 def launch(args):
-    cmd = os.environ.get('FTSYNC_CMD')
-    if cmd:
-        subprocess.run([*shlex.split(cmd), *args])
+    if CMD:
+        subprocess.run([*CMD, *args], check=False)
     else:
         subprocess.run(['flatpak', 'run', '--command=/app/bin/run.sh',
-                        '--file-forwarding', APP, '@@u', *args, '@@'])
+                        '--file-forwarding', APP, '@@u', *args, '@@'],
+                       check=False)
 
 
 def notify(msg):
     print(msg, file=sys.stderr)
     try:
-        subprocess.run(['notify-send', 'FreeTube sync failed', msg])
+        subprocess.run(['notify-send', 'FreeTube sync failed', msg], check=False)
     except FileNotFoundError:
         pass
 
@@ -148,7 +169,7 @@ def notify(msg):
 def safe_sync():
     try:
         sync()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  a failed sync must not block FreeTube
         notify(repr(e))
 
 
@@ -164,6 +185,16 @@ def test():
     assert merge3({'x': 1}, {}, {'x': 2}, None) == {'x': 2}
     h = COLLECTIONS['history.db'][1]
     assert merge3({}, {'v': {'timeWatched': 1}}, {'v': {'timeWatched': 2}}, h)['v']['timeWatched'] == 2
+    with tempfile.TemporaryDirectory() as d:
+        t = Path(d) / 'config.toml'
+        t.write_text('remote = "~/x"\ncmd = ["~/a b", "-v"]\n')
+        assert config(t)[1:] == (Path.home() / 'x', [str(Path.home() / 'a b'), '-v']), config(t)
+        t.write_text('remot = "~/x"\n')
+        try:
+            config(t)
+            raise AssertionError('typo key accepted')
+        except SystemExit:
+            pass
     print('ok')
 
 
